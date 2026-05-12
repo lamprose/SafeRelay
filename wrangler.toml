@@ -1,0 +1,6 @@
+name = "safe-relay"
+main = "worker.js"
+compatibility_date = "2026-05-12"
+
+[[kv_namespaces]]
+binding = "KV"
