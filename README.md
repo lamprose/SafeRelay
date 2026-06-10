@@ -1,28 +1,42 @@
-# SafeRelay - 安全私聊机器人
+<div align="center">
 
-## 🔥 项目简介
+# SafeRelay
 
-SafeRelay 是一个轻量级的 Telegram 私聊机器人，专注于防骚扰和高效沟通。它采用 **单对单** 模式，支持人机验证、联合封禁、自定义欢迎消息和自动回复等多个功能。
+## 安全私聊机器人 — 防骚扰 · 零成本 · Serverless
 
-机器人采用 Serverless 架构，无需服务器即可部署，零成本运行！
+[![JavaScript](https://img.shields.io/badge/JavaScript-ES6+-yellow?logo=javascript&logoColor=white)](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript) [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-100K%2Fday-orange?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![Telegram Bot](https://img.shields.io/badge/Telegram%20Bot-API%208.0+-blue?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api) [![License](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
 
-部署教程请查看 [DEPLOY.md](./DEPLOY.md)。
+</div>
+
+---
 
 ## ✨ 功能特性
 
-- **消息中转** — 用户↔管理员双向转发，支持编辑同步
-- **人机验证** — 支持 Cloudflare Turnstile 和本地题库验证，防机器人骚扰
-- **联合封禁** — 接入中心化封禁系统，恶意用户一次封禁全网拦截
-- **欺诈检测** — 本地欺诈数据库，自动识别并拦截可疑用户
-- **白名单** — VIP用户跳过所有检查，直接转发
-- **本地管理** — 拉黑/解封/重置验证，回复消息即可操作
-- **自动消息** — 自定义欢迎消息与自动回复（带10分钟冷却）
-- **图形面板** — Inline Keyboard 菜单，配置一键完成
-- **转发模式** — 私聊 ↔ 话题群组一键切换
-- **广播推送** — 向所有用户群发消息，支持 HTML，24小时冷却，分批发送
-- **编辑同步** — 用户和管理员编辑消息实时同步
-- **消息统计** — 自动统计每日消息数和活跃用户数
-- **零成本运行** — Cloudflare Workers 免费额度长期稳定运行（Workers AI 为可选功能）
+| 模块 | 说明 |
+| ---- | ---- |
+| **消息中转** | 用户↔管理员双向转发，支持编辑同步与话题模式 |
+| **人机验证** | Cloudflare Turnstile + 本地题库双重验证，有效拦截机器人 |
+| **联合封禁** | 接入中心化封禁系统，恶意用户一次封禁全网拦截 |
+| **欺诈检测** | 本地欺诈数据库实时比对，自动识别可疑用户 |
+| **白名单** | VIP 用户跳过所有检查，直接转发 |
+| **本地管理** | 拉黑/解封/重置验证，回复消息即可操作 |
+| **自动消息** | 自定义欢迎消息与自动回复（带 10 分钟冷却） |
+| **图形面板** | Inline Keyboard 菜单，配置一键完成 |
+| **转发模式** | 私聊 ↔ 话题群组一键切换 |
+| **广播推送** | 向所有已验证用户群发消息，支持 HTML，24 小时冷却 |
+| **编辑同步** | 用户和管理员编辑消息实时同步 |
+| **消息统计** | 自动统计每日消息数和活跃用户数 |
+| **零成本运行** | Cloudflare Workers 免费额度长期稳定运行 |
+
+---
+
+## 🚀 快速开始
+
+请直接查看详细部署教程：**[DEPLOY.md](./DEPLOY.md)**。
+
+部署、环境变量、Webhook 激活、Turnstile 配置和话题模式开启步骤都以 `DEPLOY.md` 为准。
+
+---
 
 ## 🤖 管理员指令
 
@@ -63,31 +77,19 @@ SafeRelay 是一个轻量级的 Telegram 私聊机器人，专注于防骚扰和
 | `/cachestats` | 查看缓存统计信息 | `/cachestats` |
 | `/clearcache` | 清空所有缓存 | `/clearcache` |
 
-### 图形化面板功能（通过 `/menu` 访问）
-
-通过管理面板可以图形化配置以下功能：
-
-- **验证模式**：切换本地题库 / Turnstile / 双重验证
-- **垃圾过滤**：开关垃圾过滤、自定义规则
-- **AI 检测**：启用 Workers AI 智能检测
-- **垃圾话题**：配置 Telegram 论坛垃圾话题
-- **转发模式**：在管理员私聊 / 论坛话题之间切换
-- **联合封禁**：接入第三方封禁系统
-- **用户管理**：查看/管理已验证用户列表
-- **欢迎消息**：设置自定义欢迎语
-- **自动回复**：设置自动回复内容
-- **统计信息**：查看消息统计
+---
 
 ## 💬 话题模式 (Forum)
 
 想把每位访客的对话整理到 Telegram 论坛话题？
 
 1. 在 Cloudflare 环境变量中设置 `GROUP_ID`，指向你的论坛群组。
-2. 确保机器人在该群里是管理员并拥有“管理话题”权限。
-3. 发送 `/menu` → 点击「💬 转发模式」→ 选择“话题转发”。
+2. 确保机器人在该群里是管理员并拥有「管理话题」权限。
+3. 发送 `/menu` → 点击「💬 转发模式」→ 选择「话题转发」。
 
 开启后，机器人会为每位新访客自动创建话题并把消息发到群里，管理员在话题中回复即可回传给访客。
 
+---
 
 ## 🧠 工作原理
 
@@ -106,12 +108,18 @@ SafeRelay 是一个轻量级的 Telegram 私聊机器人，专注于防骚扰和
 3. 管理员回复 → 自动回传给用户
 4. 已验证用户 → 消息直接转发
 
+---
+
 ## 🛡️ 安全特性
 
-- **联合封禁**：接入第三方封禁系统，自动拦截恶意用户
-- **欺诈检测**：本地欺诈数据库，实时比对可疑用户
-- **防刷屏保护**：5 秒内最多 5 条消息，防止消息轰炸
-- **人机验证**：Cloudflare Turnstile 验证，有效阻止机器人
+- **Webhook 安全验证** — 校验 `X-Telegram-Bot-Api-Secret-Token` 头部，防止伪造请求
+- **联合封禁** — 接入第三方封禁系统，自动拦截恶意用户
+- **欺诈检测** — 本地欺诈数据库，实时比对可疑用户
+- **防刷屏保护** — 5 秒内最多 5 条消息，防止消息轰炸
+- **人机验证** — Cloudflare Turnstile 验证，有效阻止机器人
+- **日志脱敏** — 自动过滤 Token、Secret 等敏感信息
+
+---
 
 ## ⚠️ 注意事项
 
@@ -121,21 +129,26 @@ SafeRelay 是一个轻量级的 Telegram 私聊机器人，专注于防骚扰和
 4. **广播冷却**：广播功能有 24 小时冷却时间，每次最多发送 500 条消息
 5. **编辑限制**：Telegram 限制只能编辑 48 小时内的消息
 
+---
+
 ## 🎯 适用场景
 
-适合：
 - 客服机器人
 - 匿名投稿机器人
 - 私聊中转机器人
 - 反馈收集机器人
 - 社群接待机器人
 
+---
+
 ## 🛠 技术栈
 
 - JavaScript (ES6+)
 - Telegram Bot API
-- Cloudflare Workers + KV
+- Cloudflare Workers + KV + Cache API
 - Cloudflare Turnstile
+
+---
 
 ## 📂 项目结构
 
@@ -151,12 +164,14 @@ SafeRelay/
 
 ### 欺诈数据库
 
-`data/fraud.db` 文件包含已知的欺诈用户ID列表，每行一个用户ID。机器人会自动检测并拦截这些用户。
+`data/fraud.db` 文件包含已知的欺诈用户 ID 列表，每行一个用户 ID。机器人会自动检测并拦截这些用户。
 
 **自定义欺诈数据库**：
 1. 编辑 `data/fraud.db` 文件
-2. 每行添加一个用户ID
-3. 提交到 GitHub 后约1小时生效（或重启Worker立即生效）
+2. 每行添加一个用户 ID
+3. 提交到 GitHub 后约 1 小时生效（或重启 Worker 立即生效）
+
+---
 
 ## 🙏 致谢
 
@@ -172,6 +187,8 @@ SafeRelay/
 
 感谢上述项目的作者们！❤️
 
+---
+
 ## 📜 许可证
 
 本项目基于 [NFD](https://github.com/LloydAsp/nfd) 开发，采用 [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) (GPL-3.0) 开源协议。
@@ -183,6 +200,24 @@ SafeRelay/
 
 详见 [LICENSE](./LICENSE) 文件。
 
+---
+
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/image?repos=qianqi32/SafeRelay&type=date&legend=top-left)](https://www.star-history.com/?repos=qianqi32%2FSafeRelay&type=date&legend=top-left)
+<a href="https://www.star-history.com/?repos=qianqi32%2FSafeRelay&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=qianqi32/SafeRelay&type=date&theme=dark&legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=qianqi32/SafeRelay&type=date&legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=qianqi32/SafeRelay&type=date&legend=top-left" />
+  </picture>
+</a>
+
+---
+
+<div align="center">
+
+**如果这个项目对你有帮助，请给一个 ⭐ Star！**
+
+**Made with ❤️ by [qianqi32](https://github.com/qianqi32/)**
+
+</div>

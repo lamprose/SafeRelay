@@ -1,8 +1,8 @@
 /**
  * SafeRelay - Telegram 私聊机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
- * 版本: 1.0.6
- * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
+ * 版本: 1.0.8
+ * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues 或者直接联系 @KiyukieBot
 */
 
 // 基础配置
@@ -335,6 +335,69 @@ const DEFAULT_SPAM_RULES = {
 };
 
 // 结构化日志系统
+// 【安全加固】所有日志输出前都会通过 sanitizeLogValue 进行脱敏，防止 Bot Token、
+// Turnstile 密钥、HMAC 签名等敏感信息泄露到 Cloudflare Logs。
+const SENSITIVE_PATTERNS = [
+  // Telegram Bot Token: 123456:ABC-DEF...
+  { re: /\bbot\d{6,}:[A-Za-z0-9_-]{20,}/g, replace: 'bot***:***' },
+  { re: /\b\d{6,12}:[A-Za-z0-9_-]{30,}/g, replace: '***:***' },
+  // Cloudflare Turnstile 密钥前缀（site key 与 secret key 都是 0x4AAA... 开头）
+  { re: /\b0x4[A-Za-z0-9]{20,}/g, replace: '0x***' },
+  // Authorization Bearer token
+  { re: /Bearer\s+[A-Za-z0-9._\-]+/gi, replace: 'Bearer ***' },
+  // URL 查询参数中常见敏感字段（sig=、secret=、token=、key=）
+  { re: /([?&](?:sig|signature|secret|token|key|secret_token)=)[^&\s"']+/gi, replace: '$1***' }
+];
+
+// 已知敏感字段名（对象键级别）
+const SENSITIVE_KEYS = new Set([
+  'token', 'secret', 'signature', 'sig', 'authorization',
+  'env_bot_token', 'env_bot_secret', 'cf_turnstile_site_key',
+  'cf_turnstile_secret_key', 'verify_signing_secret', 'cf_ai_token',
+  'password', 'apikey', 'api_key'
+]);
+
+function sanitizeLogString(str) {
+  if (typeof str !== 'string' || !str) return str;
+  let out = str;
+  for (const { re, replace } of SENSITIVE_PATTERNS) {
+    out = out.replace(re, replace);
+  }
+  return out;
+}
+
+function sanitizeLogValue(value, depth = 0) {
+  if (depth > 6) return '[Truncated]';
+  if (value == null) return value;
+  const type = typeof value;
+  if (type === 'string') return sanitizeLogString(value);
+  if (type === 'number' || type === 'boolean') return value;
+  if (Array.isArray(value)) {
+    return value.map(v => sanitizeLogValue(v, depth + 1));
+  }
+  if (type === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (SENSITIVE_KEYS.has(String(k).toLowerCase())) {
+        out[k] = '***';
+      } else {
+        out[k] = sanitizeLogValue(v, depth + 1);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function stringifyLog(payload) {
+  try {
+    return JSON.stringify(sanitizeLogValue(payload));
+  } catch (e) {
+    // 兜底：循环引用等情况
+    return JSON.stringify({ level: payload.level || 'UNKNOWN', action: payload.action || 'log_serialize_failed', error: e.message });
+  }
+}
+
 const Logger = {
   info(action, data = {}) {
     const log = {
@@ -343,7 +406,7 @@ const Logger = {
       action,
       ...data
     };
-    console.log(JSON.stringify(log));
+    console.log(stringifyLog(log));
   },
 
   warn(action, errorOrData = {}, data = {}) {
@@ -359,7 +422,7 @@ const Logger = {
       action,
       ...payload
     };
-    console.warn(JSON.stringify(log));
+    console.warn(stringifyLog(log));
   },
 
   error(action, error, data = {}) {
@@ -371,7 +434,7 @@ const Logger = {
       stack: error instanceof Error ? error.stack : undefined,
       ...data
     };
-    console.error(JSON.stringify(log));
+    console.error(stringifyLog(log));
   },
 
   debug(action, data = {}) {
@@ -381,7 +444,7 @@ const Logger = {
       action,
       ...data
     };
-    console.log(JSON.stringify(log));
+    console.log(stringifyLog(log));
   },
 
   /**
@@ -485,26 +548,30 @@ async function callUnionBanApi(endpoint, payload) {
 async function checkUnionBan(userId) {
   const gbanKey = `gban:${userId}`;
 
-  // 1. 检查内存缓存
   let gbanStatus = memGet(gbanKey);
   if (gbanStatus !== undefined) {
     return gbanStatus === "true";
   }
 
-  // 2. 检查 KV 缓存
-  gbanStatus = await KV.get(gbanKey);
-  if (gbanStatus !== null) {
+  gbanStatus = await cacheApiGet(gbanKey);
+  if (gbanStatus !== undefined) {
     memSet(gbanKey, gbanStatus, 30 * 60 * 1000);
     return gbanStatus === "true";
   }
 
-  // 3. 调用远程 API
+  gbanStatus = await KV.get(gbanKey);
+  if (gbanStatus !== null) {
+    memSet(gbanKey, gbanStatus, 30 * 60 * 1000);
+    await cacheApiSet(gbanKey, gbanStatus, 1800);
+    return gbanStatus === "true";
+  }
+
   const remoteCheck = await callUnionBanApi('/check_ban', { user_id: String(userId) });
   gbanStatus = (remoteCheck && remoteCheck.banned) ? "true" : "false";
 
-  // 写入 KV 缓存
   await KV.put(gbanKey, gbanStatus, { expirationTtl: UNION_BAN_CACHE_TTL });
   memSet(gbanKey, gbanStatus, 30 * 60 * 1000);
+  await cacheApiSet(gbanKey, gbanStatus, 1800);
 
   return gbanStatus === "true";
 }
@@ -513,20 +580,24 @@ async function checkUnionBan(userId) {
 async function checkFraud(userId) {
   const fraudKey = `fraud:${userId}`;
 
-  // 1. 检查内存缓存
   let fraudStatus = memGet(fraudKey);
   if (fraudStatus !== undefined) {
     return fraudStatus === "true";
   }
 
-  // 2. 检查 KV 缓存
-  fraudStatus = await KV.get(fraudKey);
-  if (fraudStatus !== null) {
+  fraudStatus = await cacheApiGet(fraudKey);
+  if (fraudStatus !== undefined) {
     memSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL * 1000);
     return fraudStatus === "true";
   }
 
-  // 3. 获取欺诈数据库
+  fraudStatus = await KV.get(fraudKey);
+  if (fraudStatus !== null) {
+    memSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL * 1000);
+    await cacheApiSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL);
+    return fraudStatus === "true";
+  }
+
   try {
     const db = await fetch(FRAUD_DB_URL).then(r => r.text());
     const fraudList = db.split('\n').filter(v => v.trim());
@@ -534,9 +605,9 @@ async function checkFraud(userId) {
 
     fraudStatus = isFraud ? "true" : "false";
 
-    // 写入 KV 缓存（1小时）
     await KV.put(fraudKey, fraudStatus, { expirationTtl: FRAUD_CACHE_TTL });
     memSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL * 1000);
+    await cacheApiSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL);
 
     return isFraud;
   } catch (err) {
@@ -549,6 +620,7 @@ async function checkFraud(userId) {
 
 // 话题健康状态缓存（内存缓存）
 const threadHealthCache = new Map();
+const topicCreateInFlight = new Map();
 
 /**
  * 验证话题是否有效（带缓存）
@@ -558,6 +630,9 @@ const threadHealthCache = new Map();
  */
 async function validateForumThread(groupId, threadId) {
   if (!groupId || !threadId) return false;
+
+  const closedStatus = await KV.get(`thread_closed:${threadId}`);
+  if (closedStatus === '1') return false;
 
   const cacheKey = `thread:${threadId}`;
   const now = Date.now();
@@ -663,6 +738,18 @@ async function pingForumThread(groupId, threadId) {
   }
 }
 
+async function updateThreadClosedStatus(threadId, closed) {
+  if (!threadId) return;
+  const key = `thread_closed:${threadId}`;
+  if (closed) {
+    await KV.put(key, '1', { expirationTtl: 172800 });
+    threadHealthCache.set(`thread:${threadId}`, { ok: false, ts: Date.now() });
+  } else {
+    await safeKvDelete(key);
+    threadHealthCache.delete(`thread:${threadId}`);
+  }
+}
+
 /**
  * 重置用户验证状态并触发重新验证
  * @param {object} options - 选项
@@ -693,8 +780,7 @@ async function resetUserVerificationAndRequireReverify({
     await safeKvDelete(`verified-${userId}`);
     await safeKvDelete(`user:${userId}`);
 
-    // 清理内存缓存
-    memDelete(`verified-${userId}`);
+    await invalidateCache(`verified-${userId}`);
     memDelete(`user:${userId}`);
     if (oldThreadId) {
       threadHealthCache.delete(`thread:${oldThreadId}`);
@@ -1142,13 +1228,17 @@ async function forwardToSpamTopic(message, groupId, topicId) {
       message_id: message.message_id
     });
     if (result.ok && result.result && result.result.message_id) {
-      await KV.put('msg-map-' + result.result.message_id, message.chat.id.toString(), { expirationTtl: 172800 });
-      await KV.put('spam-orig-' + result.result.message_id, message.message_id.toString(), { expirationTtl: 172800 });
+      const fwdId = result.result.message_id;
       const userId = message.from ? String(message.from.id) : message.chat.id.toString();
+      const kvWrites = [
+        KV.put('msg-map-' + fwdId, message.chat.id.toString(), { expirationTtl: 172800 }),
+        KV.put('spam-orig-' + fwdId, message.message_id.toString(), { expirationTtl: 172800 }),
+      ];
       const threadId = await KV.get(`user:${userId}:topic`);
       if (threadId) {
-        await KV.put('spam-thread-' + result.result.message_id, threadId, { expirationTtl: 172800 });
+        kvWrites.push(KV.put('spam-thread-' + fwdId, threadId, { expirationTtl: 172800 }));
       }
+      await Promise.all(kvWrites);
     }
     return true;
   } catch (e) {
@@ -1163,9 +1253,10 @@ async function silentlyForwardSpamMessage(message, groupId, topicId) {
     // 转发到垃圾话题
     await forwardToSpamTopic(message, groupId, topicId);
 
-    // 通知管理员
+    // 通知到垃圾话题，避免群组模式下打扰管理员私聊
     await sendMessage({
-      chat_id: ADMIN_UID,
+      chat_id: groupId,
+      message_thread_id: topicId,
       text: `🗑 <b>垃圾消息已静默处理</b>\n\nUID: <code>${message.from?.id}</code>\n话题 ID: <code>${topicId}</code>\n\n<i>消息已转发到垃圾话题，用户无感知</i>`,
       parse_mode: 'HTML'
     });
@@ -1180,8 +1271,10 @@ async function silentlyForwardSpamMessage(message, groupId, topicId) {
 // 从垃圾话题恢复消息
 async function restoreMessageFromSpamTopic(groupId, spamTopicId, targetTopicId, messageId) {
   try {
-    const guestChatId = await KV.get('msg-map-' + messageId);
-    const origMessageId = await KV.get('spam-orig-' + messageId);
+    const [guestChatId, origMessageId] = await Promise.all([
+      KV.get('msg-map-' + messageId),
+      KV.get('spam-orig-' + messageId),
+    ]);
 
     if (!guestChatId) {
       Logger.warn('restore_spam_no_mapping', { messageId });
@@ -1197,9 +1290,12 @@ async function restoreMessageFromSpamTopic(groupId, spamTopicId, targetTopicId, 
         message_id: messageId
       });
       if (forwardResult.ok && forwardResult.result && forwardResult.result.message_id) {
-        await KV.put('msg-map-' + forwardResult.result.message_id, guestChatId, { expirationTtl: 172800 });
-        await KV.put('orig-map-' + (origMessageId || forwardResult.result.message_id), forwardResult.result.message_id.toString(), { expirationTtl: 172800 });
-        await KV.put('fwd-loc-' + forwardResult.result.message_id, JSON.stringify({ chat_id: groupId, thread_id: targetTopicId }), { expirationTtl: 172800 });
+        const fwdId = forwardResult.result.message_id;
+        await Promise.all([
+          KV.put('msg-map-' + fwdId, guestChatId, { expirationTtl: 172800 }),
+          KV.put('orig-map-' + (origMessageId || fwdId), fwdId.toString(), { expirationTtl: 172800 }),
+          KV.put('fwd-loc-' + fwdId, JSON.stringify({ chat_id: groupId, thread_id: targetTopicId }), { expirationTtl: 172800 }),
+        ]);
       }
     } else {
       const copyResult = await copyMessage({
@@ -1225,6 +1321,22 @@ async function restoreMessageFromSpamTopic(groupId, spamTopicId, targetTopicId, 
 
 // ========== 用户话题管理 ==========
 async function ensureUserTopic(userId, profile = null) {
+  const inFlightKey = String(userId);
+  const inFlight = topicCreateInFlight.get(inFlightKey);
+  if (inFlight) return inFlight;
+
+  const promise = ensureUserTopicInternal(userId, profile);
+  topicCreateInFlight.set(inFlightKey, promise);
+  try {
+    return await promise;
+  } finally {
+    if (topicCreateInFlight.get(inFlightKey) === promise) {
+      topicCreateInFlight.delete(inFlightKey);
+    }
+  }
+}
+
+async function ensureUserTopicInternal(userId, profile = null) {
   if (!GROUP_ID) {
     Logger.warn('ensure_user_topic_no_group_id', { userId });
     return null;
@@ -1411,20 +1523,13 @@ async function releaseTopicLock(userId, token) {
 }
 
 function buildUserTopicTitle(userId, profile = null) {
-  const parts = [];
+  let displayName = '';
   if (profile) {
-    if (profile.first_name || profile.last_name) {
-      parts.push(`${profile.first_name || ''} ${profile.last_name || ''}`.trim());
-    }
-    if (profile.username) {
-      parts.push(`@${profile.username}`);
-    }
+    displayName = `${profile.first_name || ''} ${profile.last_name || ''}`.trim();
   }
+  if (!displayName) displayName = '访客';
 
-  let base = parts.filter(Boolean).join(' ');
-  if (!base) base = `访客 ${userId}`;
-
-  let title = `#${userId} ${base}`.trim();
+  let title = `${displayName}（${userId}）`;
   if (title.length > 60) {
     title = title.slice(0, 60);
   }
@@ -1442,7 +1547,7 @@ async function sendTopicWelcomeMessage(threadId, userId, profile = null) {
       lines.push(`用户名：@${escapeHtml(profile.username)}`);
     }
     if (profile?.first_name || profile?.last_name) {
-      lines.push(`姓名：${escapeHtml(`${profile.first_name || ''} ${profile.last_name || ''}`.trim())}`);
+      lines.push(`昵称：${escapeHtml(`${profile.first_name || ''} ${profile.last_name || ''}`.trim())}`);
     }
     lines.push('\n请在此话题内回复用户消息。');
 
@@ -1721,7 +1826,69 @@ const TOPIC_ENV_CACHE_TTL_MS = 5 * 60 * 1000;
 const TOPIC_ENV_ALERT_CACHE_KEY = 'topic_env_alert';
 const TOPIC_ENV_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 
-// L2 缓存：KV 缓存（较慢，持久化）
+// L2 缓存：Cache API（免费、冷启动友好、同 PoP 内跨 isolate 共享）
+const CACHE_API_BASE_URL = 'https://cache.saferelay.internal';
+
+async function cacheApiGet(key) {
+  try {
+    const cache = caches.default;
+    if (!cache) return undefined;
+    const url = new URL(`/__cache/${encodeURIComponent(key)}`, CACHE_API_BASE_URL);
+    const resp = await cache.match(url);
+    if (!resp) {
+      cacheStats.cacheApiMisses++;
+      return undefined;
+    }
+    const ageHeader = resp.headers.get('age');
+    const maxAge = parseInt(resp.headers.get('cache-control')?.match(/max-age=(\d+)/)?.[1] || '0', 10);
+    if (maxAge > 0 && ageHeader && parseInt(ageHeader, 10) > maxAge) {
+      await cache.delete(url);
+      cacheStats.cacheApiMisses++;
+      return undefined;
+    }
+    cacheStats.cacheApiHits++;
+    const text = await resp.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  } catch (e) {
+    cacheStats.cacheApiMisses++;
+    return undefined;
+  }
+}
+
+async function cacheApiSet(key, value, ttlSeconds) {
+  try {
+    const cache = caches.default;
+    if (!cache) return;
+    const url = new URL(`/__cache/${encodeURIComponent(key)}`, CACHE_API_BASE_URL);
+    const body = typeof value === 'string' ? value : JSON.stringify(value);
+    const resp = new Response(body, {
+      headers: {
+        'Cache-Control': `public, max-age=${ttlSeconds}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    await cache.put(url, resp);
+  } catch (e) {
+    // Cache API 不可用时静默降级
+  }
+}
+
+async function cacheApiDelete(key) {
+  try {
+    const cache = caches.default;
+    if (!cache) return;
+    const url = new URL(`/__cache/${encodeURIComponent(key)}`, CACHE_API_BASE_URL);
+    await cache.delete(url);
+  } catch (e) {
+    // 静默降级
+  }
+}
+
+// L3 缓存：KV 缓存（最慢，持久化，消耗配额）
 const KV_CACHE_TTL = 60 * 60; // 1 小时
 
 // 缓存统计
@@ -1729,7 +1896,9 @@ const cacheStats = {
   hits: 0,
   misses: 0,
   kvHits: 0,
-  kvMisses: 0
+  kvMisses: 0,
+  cacheApiHits: 0,
+  cacheApiMisses: 0
 };
 
 /**
@@ -1782,7 +1951,7 @@ function memDelete(key) {
 }
 
 /**
- * L2 缓存获取（KV 持久化）
+ * L3 缓存获取（KV 持久化，消耗配额）
  * @param {string} key - 缓存键
  * @param {any} defaultValue - 默认值
  * @returns {Promise<any>} 缓存值
@@ -1803,7 +1972,7 @@ async function kvCacheGet(key, defaultValue = null) {
 }
 
 /**
- * L2 缓存设置（KV 持久化）
+ * L3 缓存设置（KV 持久化，消耗配额）
  * @param {string} key - 缓存键
  * @param {any} value - 缓存值
  * @param {number} ttlSeconds - 过期时间（秒）
@@ -1817,36 +1986,85 @@ async function kvCacheSet(key, value, ttlSeconds = KV_CACHE_TTL) {
 }
 
 /**
- * 多级缓存获取（L1 → L2）
+ * 三级缓存获取（L1 内存 → L2 Cache API → L3 KV）
+ * Cache API 免费、冷启动友好、同 PoP 跨 isolate 共享，
+ * 作为内存与 KV 之间的快速能力层，大幅减少冷启动时的 KV 读取。
  * @param {string} key - 缓存键
  * @param {Function} fetchFn - 获取数据的异步函数
  * @param {number} l1Ttl - L1 缓存 TTL（毫秒）
- * @param {number} l2Ttl - L2 缓存 TTL（秒）
+ * @param {number} l2Ttl - L2 Cache API TTL（秒）
+ * @param {number} l3Ttl - L3 KV TTL（秒）
  * @returns {Promise<any>} 缓存值
  */
-async function multiLevelCacheGet(key, fetchFn, l1Ttl = MEMORY_CACHE_TTL, l2Ttl = KV_CACHE_TTL) {
-  // 尝试 L1 缓存
+async function multiLevelCacheGet(key, fetchFn, l1Ttl = MEMORY_CACHE_TTL, l2Ttl = KV_CACHE_TTL, l3Ttl = KV_CACHE_TTL) {
   let value = memGet(key);
   if (value !== undefined) {
     return value;
   }
 
-  // 尝试 L2 缓存
-  value = await kvCacheGet(key);
-  if (value !== null) {
-    // 回填 L1 缓存
+  value = await cacheApiGet(key);
+  if (value !== undefined) {
     memSet(key, value, l1Ttl);
     return value;
   }
 
-  // 缓存未命中，调用 fetchFn 获取
+  value = await kvCacheGet(key);
+  if (value !== null) {
+    memSet(key, value, l1Ttl);
+    await cacheApiSet(key, value, l2Ttl);
+    return value;
+  }
+
   value = await fetchFn();
 
-  // 同时写入 L1 和 L2 缓存
   memSet(key, value, l1Ttl);
-  await kvCacheSet(key, value, l2Ttl);
+  await cacheApiSet(key, value, l2Ttl);
+  await kvCacheSet(key, value, l3Ttl);
 
   return value;
+}
+
+/**
+ * 冷启动友好的热路径缓存读取（L1 → L2 Cache API，不读 KV）
+ * 适用于高频但可容忍短暂不一致的数据（白名单、黑名单、验证状态等），
+ * 冷启动时 Cache API 仍可命中，避免 KV 读取消耗配额。
+ * @param {string} key - 缓存键
+ * @param {Function} fetchFn - 回源函数（仅在 L1/L2 均未命中时调用）
+ * @param {number} l1Ttl - L1 TTL（毫秒）
+ * @param {number} l2Ttl - L2 Cache API TTL（秒）
+ * @returns {Promise<any>} 缓存值
+ */
+async function hotCacheGet(key, fetchFn, l1Ttl = 30 * 1000, l2Ttl = 120) {
+  let value = memGet(key);
+  if (value !== undefined) {
+    return value;
+  }
+
+  value = await cacheApiGet(key);
+  if (value !== undefined) {
+    memSet(key, value, l1Ttl);
+    return value;
+  }
+
+  value = await fetchFn();
+
+  memSet(key, value, l1Ttl);
+  await cacheApiSet(key, value, l2Ttl);
+
+  return value;
+}
+
+/**
+ * 失效所有缓存层（L1 + L2 Cache API + 可选 L3 KV）
+ * @param {string} key - 缓存键
+ * @param {boolean} invalidateKv - 是否同时失效 KV（默认 false，KV 由写入方保证一致性）
+ */
+async function invalidateCache(key, invalidateKv = false) {
+  memDelete(key);
+  await cacheApiDelete(key);
+  if (invalidateKv) {
+    try { await KV.delete(key); } catch (e) { /* 静默 */ }
+  }
 }
 
 /**
@@ -1856,6 +2074,8 @@ async function multiLevelCacheGet(key, fetchFn, l1Ttl = MEMORY_CACHE_TTL, l2Ttl 
 function getCacheStats() {
   const total = cacheStats.hits + cacheStats.misses;
   const hitRate = total > 0 ? ((cacheStats.hits / total) * 100).toFixed(2) : 0;
+  const cacheApiTotal = cacheStats.cacheApiHits + cacheStats.cacheApiMisses;
+  const cacheApiHitRate = cacheApiTotal > 0 ? ((cacheStats.cacheApiHits / cacheApiTotal) * 100).toFixed(2) : 0;
   const kvTotal = cacheStats.kvHits + cacheStats.kvMisses;
   const kvHitRate = kvTotal > 0 ? ((cacheStats.kvHits / kvTotal) * 100).toFixed(2) : 0;
 
@@ -1867,6 +2087,11 @@ function getCacheStats() {
       size: memCache.size
     },
     l2: {
+      hits: cacheStats.cacheApiHits,
+      misses: cacheStats.cacheApiMisses,
+      hitRate: cacheApiHitRate + '%'
+    },
+    l3: {
       hits: cacheStats.kvHits,
       misses: cacheStats.kvMisses,
       hitRate: kvHitRate + '%'
@@ -1881,11 +2106,16 @@ function clearAllCache() {
   memCache.clear();
   cacheStats.hits = 0;
   cacheStats.misses = 0;
+  cacheStats.cacheApiHits = 0;
+  cacheStats.cacheApiMisses = 0;
   cacheStats.kvHits = 0;
   cacheStats.kvMisses = 0;
 }
 
 // ========== KV 配额熔断保护 ==========
+// 【优化】使用内存变量作为熔断器状态，避免在 KV 配额耗尽时无法读写熔断标记
+let _kvQuotaBreakerUntil = 0;       // 熔断到期时间戳（ms）
+let _kvQuotaLastNoticeAt = 0;       // 上一次通知时间戳（ms），用于通知冷却
 
 // 检查是否为 KV 配额错误
 function isKvQuotaError(err) {
@@ -1900,30 +2130,30 @@ function isKvQuotaError(err) {
     (msg.includes("429") && (msg.includes("too many requests") || msg.includes("rate") || msg.includes("quota") || msg.includes("limit")));
 }
 
-// 触发熔断器
-async function tripKvQuotaBreaker() {
-  await KV.put(CONFIG.KV_QUOTA_BREAKER_KEY, "1", { expirationTtl: CONFIG.KV_QUOTA_BREAKER_TTL });
+// 触发熔断器（仅写内存，避免再次调用 KV）
+function tripKvQuotaBreaker() {
+  _kvQuotaBreakerUntil = Date.now() + (CONFIG.KV_QUOTA_BREAKER_TTL * 1000);
   Logger.warn('kv_quota_breaker_tripped', { ttl: CONFIG.KV_QUOTA_BREAKER_TTL });
 }
 
-// 检查熔断器是否触发
-async function isKvQuotaBreakerTripped() {
-  const v = await KV.get(CONFIG.KV_QUOTA_BREAKER_KEY);
-  return v === "1";
+// 检查熔断器是否触发（纯内存读取）
+function isKvQuotaBreakerTripped() {
+  return Date.now() < _kvQuotaBreakerUntil;
 }
 
-// 检查是否应该发送 KV 配额超限通知
-async function shouldSendKvQuotaNotice() {
-  const key = `kv_quota_notice:${ADMIN_UID}`;
-  const lastNotice = await KV.get(key);
-  if (lastNotice) return false;
-  await KV.put(key, "1", { expirationTtl: CONFIG.KV_QUOTA_NOTICE_COOLDOWN });
+// 检查是否应该发送 KV 配额超限通知（基于内存冷却，避免再次调用 KV）
+function shouldSendKvQuotaNotice() {
+  const now = Date.now();
+  if (now - _kvQuotaLastNoticeAt < CONFIG.KV_QUOTA_NOTICE_COOLDOWN * 1000) {
+    return false;
+  }
+  _kvQuotaLastNoticeAt = now;
   return true;
 }
 
 // 发送 KV 配额超限通知
 async function sendKvQuotaExceededNotice() {
-  if (!(await shouldSendKvQuotaNotice())) return;
+  if (!shouldSendKvQuotaNotice()) return;
   try {
     await sendMessage({
       chat_id: ADMIN_UID,
@@ -1937,45 +2167,46 @@ async function sendKvQuotaExceededNotice() {
 
 // 安全的 KV 操作包装（带熔断保护）
 async function safeKvGet(key) {
-  if (await isKvQuotaBreakerTripped()) {
+  if (isKvQuotaBreakerTripped()) {
     throw new Error('KV quota breaker is tripped');
   }
   try {
     return await KV.get(key);
   } catch (e) {
     if (isKvQuotaError(e)) {
-      await tripKvQuotaBreaker();
-      await sendKvQuotaExceededNotice();
+      tripKvQuotaBreaker();
+      // 注意：sendKvQuotaExceededNotice 内部调用 sendMessage（Telegram API），不会再触发 KV
+      sendKvQuotaExceededNotice().catch(err => Logger.error('kv_quota_notice_failed', err));
     }
     throw e;
   }
 }
 
 async function safeKvPut(key, value, options = {}) {
-  if (await isKvQuotaBreakerTripped()) {
+  if (isKvQuotaBreakerTripped()) {
     throw new Error('KV quota breaker is tripped');
   }
   try {
     return await KV.put(key, value, options);
   } catch (e) {
     if (isKvQuotaError(e)) {
-      await tripKvQuotaBreaker();
-      await sendKvQuotaExceededNotice();
+      tripKvQuotaBreaker();
+      sendKvQuotaExceededNotice().catch(err => Logger.error('kv_quota_notice_failed', err));
     }
     throw e;
   }
 }
 
 async function safeKvDelete(key) {
-  if (await isKvQuotaBreakerTripped()) {
+  if (isKvQuotaBreakerTripped()) {
     throw new Error('KV quota breaker is tripped');
   }
   try {
     return await KV.delete(key);
   } catch (e) {
     if (isKvQuotaError(e)) {
-      await tripKvQuotaBreaker();
-      await sendKvQuotaExceededNotice();
+      tripKvQuotaBreaker();
+      sendKvQuotaExceededNotice().catch(err => Logger.error('kv_quota_notice_failed', err));
     }
     throw e;
   }
@@ -1986,6 +2217,19 @@ async function safeKvDelete(key) {
 // 获取暂存队列 key
 function pendingQueueKey(userId) {
   return `pending_queue:${userId}`;
+}
+
+function pendingMessageKey(userId, messageId) {
+  return `pending_msg:${userId}:${messageId}`;
+}
+
+function buildPendingMessageSnapshot(message, userId) {
+  return {
+    chat: { id: userId },
+    message_id: message.message_id,
+    text: message.text || '',
+    caption: message.caption || ''
+  };
 }
 
 // 获取用户的暂存消息队列
@@ -2002,13 +2246,20 @@ async function getPendingQueue(userId) {
 }
 
 // 添加消息到暂存队列（带去重）
-async function appendPendingQueue(userId, messageId) {
+async function appendPendingQueue(userId, message) {
+  const messageId = typeof message === 'object' ? message.message_id : message;
   const mid = Number(messageId);
   if (!Number.isFinite(mid) || mid <= 0) return await getPendingQueue(userId);
 
   // 【优化】使用 safeGetJSON 安全读取
   let arr = await safeGetJSON(pendingQueueKey(userId), []);
   if (!Array.isArray(arr)) arr = [];
+
+  if (message && typeof message === 'object') {
+    await KV.put(pendingMessageKey(userId, mid), JSON.stringify(buildPendingMessageSnapshot(message, userId)), {
+      expirationTtl: CONFIG.PENDING_QUEUE_TTL_SECONDS
+    });
+  }
 
   // 【优化】去重检查：避免同一消息重复添加
   if (arr.includes(mid)) {
@@ -2040,6 +2291,18 @@ async function clearPendingQueue(userId) {
     await KV.delete(pendingQueueKey(userId));
   } catch (e) {
     Logger.error('clear_pending_queue_failed', e, { userId });
+  }
+}
+
+async function getPendingMessageSnapshot(userId, messageId) {
+  return await safeGetJSON(pendingMessageKey(userId, messageId), null);
+}
+
+async function deletePendingMessageSnapshot(userId, messageId) {
+  try {
+    await KV.delete(pendingMessageKey(userId, messageId));
+  } catch (e) {
+    Logger.warn('delete_pending_message_snapshot_failed', e, { userId, messageId });
   }
 }
 
@@ -2076,6 +2339,16 @@ async function processPendingMessagesAfterVerification(userId) {
   for (let i = 0; i < sortedIds.length; i++) {
     const msgId = sortedIds[i];
     try {
+      const pendingMessage = await getPendingMessageSnapshot(userId, msgId);
+      if (pendingMessage) {
+        const spamCheck = await checkSpam(pendingMessage, userId);
+        if (spamCheck.isSpam) {
+          Logger.info('pending_spam_blocked_after_verification', { userId, messageId: msgId, reason: spamCheck.reason });
+          await deletePendingMessageSnapshot(userId, msgId);
+          continue;
+        }
+      }
+
       // 尝试转发消息（通过复制方式）
       const payload = {
         chat_id: targetForPending.chatId,
@@ -2089,18 +2362,28 @@ async function processPendingMessagesAfterVerification(userId) {
       const result = await forwardMessage(payload);
 
       if (result.ok && result.result && result.result.message_id) {
-        forwarded++;
-        await storeForwardMapping(
-          result.result.message_id,
-          { chat: { id: userId }, message_id: msgId },
-          targetForPending
-        );
+        if (!isForwardedToExpectedThread(result, targetForPending)) {
+          Logger.warn('pending_forward_misdirected_thread', { userId, messageId: msgId, expectedThreadId: targetForPending.threadId, actualThreadId: result.result.message_thread_id });
+          await deleteForwardedResultMessages(result, targetForPending);
+          failed++;
+          failedMessages.push(msgId);
+        } else {
+          forwarded++;
+          await storeForwardMapping(
+            result.result.message_id,
+            { chat: { id: userId }, message_id: msgId },
+            targetForPending
+          );
+          await deletePendingMessageSnapshot(userId, msgId);
+        }
       } else if (result.ok) {
         forwarded++;
+        await deletePendingMessageSnapshot(userId, msgId);
       } else {
         // 【优化】区分错误类型：消息不存在 vs 其他错误
         if (result.description && result.description.includes('message to forward not found')) {
           Logger.warn('pending_message_not_found', { userId, messageId: msgId });
+          await deletePendingMessageSnapshot(userId, msgId);
           // 消息不存在，视为成功（不需要重试）
         } else {
           failed++;
@@ -2228,25 +2511,29 @@ async function getUserDisplayName(userId) {
 async function isUserVerified(userId) {
   const verifiedKey = 'verified-' + userId;
 
-  // 1. 先检查内存缓存
   const memVerified = memGet(verifiedKey);
   if (memVerified !== undefined) {
     return memVerified === "true";
   }
 
-  // 2. 检查 KV（带重试机制，解决最终一致性延迟问题）
+  const cacheApiValue = await cacheApiGet(verifiedKey);
+  if (cacheApiValue !== undefined) {
+    const isVerified = cacheApiValue === 'true';
+    memSet(verifiedKey, cacheApiValue, 5 * 60 * 1000);
+    if (isVerified) return true;
+  }
+
   const maxRetries = 3;
-  const retryDelay = 1500; // 1.5秒
+  const retryDelay = 1500;
 
   for (let i = 0; i < maxRetries; i++) {
     const kvVerified = await KV.get(verifiedKey);
     if (kvVerified === 'true') {
-      // 更新内存缓存
       memSet(verifiedKey, 'true', 5 * 60 * 1000);
+      await cacheApiSet(verifiedKey, 'true', 300);
       return true;
     }
 
-    // 如果不是最后一次尝试，等待后重试
     if (i < maxRetries - 1) {
       await new Promise(r => setTimeout(r, retryDelay));
     }
@@ -2256,15 +2543,36 @@ async function isUserVerified(userId) {
 }
 
 // 获取所有白名单用户
+// 【优化】L1 缓存白名单字符串（30 秒），降低 onMessage 热路径上的 KV 读取
+const WHITELIST_CACHE_KEY = '__whitelist_cache__';
+const WHITELIST_CACHE_TTL_MS = 30 * 1000;
+
 async function getWhitelist() {
+  const cached = memGet(WHITELIST_CACHE_KEY);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const cacheApiValue = await cacheApiGet(WHITELIST_CACHE_KEY);
+  if (cacheApiValue !== undefined) {
+    memSet(WHITELIST_CACHE_KEY, cacheApiValue, WHITELIST_CACHE_TTL_MS);
+    return cacheApiValue;
+  }
   const whitelistData = await KV.get('whitelist-data');
-  return whitelistData ? whitelistData.split(',').filter(v => v) : [];
+  const list = whitelistData ? whitelistData.split(',').filter(v => v) : [];
+  memSet(WHITELIST_CACHE_KEY, list, WHITELIST_CACHE_TTL_MS);
+  await cacheApiSet(WHITELIST_CACHE_KEY, list, 120);
+  return list;
+}
+
+async function invalidateWhitelistCache() {
+  memDelete(WHITELIST_CACHE_KEY);
+  await cacheApiDelete(WHITELIST_CACHE_KEY);
 }
 
 // 检查用户是否在白名单中
 async function isWhitelisted(userId) {
   const whitelist = await getWhitelist();
-  return whitelist.includes(userId);
+  return whitelist.includes(String(userId));
 }
 
 // 添加用户到白名单
@@ -2273,14 +2581,43 @@ async function addToWhitelist(userId) {
   if (!whitelist.includes(userId)) {
     whitelist.push(userId);
     await KV.put('whitelist-data', whitelist.join(','));
+    await invalidateWhitelistCache();
   }
 }
 
-// 从白名单移除用户
 async function removeFromWhitelist(userId) {
   const whitelist = await getWhitelist();
   const newWhitelist = whitelist.filter(id => id !== userId);
   await KV.put('whitelist-data', newWhitelist.join(','));
+  await invalidateWhitelistCache();
+}
+
+// 【优化】带 L1 缓存的黑名单检查（用于热路径 onMessage）
+// 黑名单变化通过 /ban /unban 触发，调用方需配合 invalidateBlockedCache 失效缓存
+const BLOCKED_CACHE_TTL_MS = 60 * 1000;
+async function isBlockedCached(userId) {
+  const memKey = `blocked-${userId}`;
+  const cached = memGet(memKey);
+  if (cached !== undefined) {
+    return cached === 'true';
+  }
+  const cacheApiValue = await cacheApiGet(memKey);
+  if (cacheApiValue !== undefined) {
+    const blocked = cacheApiValue === 'true';
+    memSet(memKey, cacheApiValue, BLOCKED_CACHE_TTL_MS);
+    return blocked;
+  }
+  const value = await KV.get('blocked-' + userId);
+  const strVal = value ? 'true' : 'false';
+  memSet(memKey, strVal, BLOCKED_CACHE_TTL_MS);
+  await cacheApiSet(memKey, strVal, 120);
+  return !!value;
+}
+
+async function invalidateBlockedCache(userId) {
+  const memKey = `blocked-${userId}`;
+  memDelete(memKey);
+  await cacheApiDelete(memKey);
 }
 
 // ========== 管理员权限缓存 ==========
@@ -2561,16 +2898,25 @@ async function getConfig(key, defaultValue = null) {
   let value = memGet(cacheKey);
   if (value !== undefined) return value;
 
+  value = await cacheApiGet(cacheKey);
+  if (value !== undefined) {
+    memSet(cacheKey, value);
+    return value;
+  }
+
   value = await KV.get(key);
   if (value !== null) {
     memSet(cacheKey, value);
+    await cacheApiSet(cacheKey, value, 300);
   }
   return value !== null ? value : defaultValue;
 }
 
 async function setConfig(key, value) {
   await KV.put(key, value);
-  memSet(`cfg:${key}`, value);
+  const cacheKey = `cfg:${key}`;
+  memSet(cacheKey, value);
+  await cacheApiSet(cacheKey, value, 300);
 }
 
 async function getForwardMode() {
@@ -2716,26 +3062,36 @@ async function getVerifiedUsers() {
 }
 
 // 分批广播辅助函数（参考 RelayGo 实现）
+// 【优化】
+// 1. 修复隐藏 Bug：getVerifiedUsers() 返回 [[userId, name], ...]，旧实现 for-of 直接拿到数组当 userId 使用，
+//    导致 'blocked-' + userId 拼接错误且 sendMessage chat_id 也是数组。
+// 2. 进入批次前一次性预读全部 blocked 用户到 Set，避免 N 次 KV.get('blocked-*')，
+//    在 500 用户广播时可节省 ~500 次 KV 读取（约 5% 的免费日额度）。
 async function sendBroadcastBatch(broadcastMsg, offset, batchSize) {
   const users = await getVerifiedUsers();
   const total = users.length;
   const batch = users.slice(offset, offset + batchSize);
+
+  // 【优化】一次性预读全部 blocked 用户 ID 到内存 Set
+  const blockedSet = await loadBlockedUsersSet();
 
   let sent = 0, failed = 0, skipped = 0;
   const startTime = Date.now();
   const maxDuration = 25000; // 25秒超时
   let timedOut = false;
 
-  for (const userId of batch) {
+  for (const entry of batch) {
+    // 兼容旧/新两种数据结构：[userId, name] 或 userId 字符串
+    const userId = Array.isArray(entry) ? String(entry[0]) : String(entry);
+
     // 超时检查
     if (Date.now() - startTime > maxDuration) {
       timedOut = true;
       break;
     }
 
-    // 检查用户是否被封禁
-    const isBlocked = await KV.get('blocked-' + userId);
-    if (isBlocked) {
+    // 【优化】内存集合 O(1) 查找，无需 KV 调用
+    if (blockedSet.has(userId)) {
       skipped++;
       continue;
     }
@@ -2772,21 +3128,77 @@ async function sendBroadcastBatch(broadcastMsg, offset, batchSize) {
   };
 }
 
+// 【优化】一次性加载所有被封禁用户 ID 集合（用于广播预过滤）
+// 使用 KV.list 进行游标分页扫描，相比逐条 KV.get 大幅降低读次数
+async function loadBlockedUsersSet() {
+  const blocked = new Set();
+  let cursor;
+  try {
+    while (true) {
+      const result = await KV.list({ prefix: 'blocked-', limit: 1000, cursor });
+      for (const k of result.keys) {
+        blocked.add(k.name.replace(/^blocked-/, ''));
+      }
+      // Cloudflare KV: list_complete 或 cursor 为 undefined 表示遍历结束
+      if (result.list_complete || !result.cursor) break;
+      cursor = result.cursor;
+    }
+  } catch (e) {
+    Logger.error('load_blocked_set_failed', e);
+  }
+  return blocked;
+}
+
 // 统计功能
+// 【优化】内存累加 + 延迟刷写，避免每条消息触发 2 次 KV.get + 2 次 KV.put
+const FLUSH_INTERVAL_MS = 30 * 1000;
+const _statsBuffer = { daily: 0, total: 0, today: '', dirty: false, flushing: false };
+
+async function _flushStatsBuffer() {
+  if (_statsBuffer.flushing || !_statsBuffer.dirty) return;
+  _statsBuffer.flushing = true;
+  _statsBuffer.dirty = false;
+  try {
+    const dailyKey = `stats:messages:${_statsBuffer.today}`;
+    const totalKey = 'stats:messages:total';
+    const [dailyCount, totalCount] = await Promise.all([
+      KV.get(dailyKey),
+      KV.get(totalKey),
+    ]);
+    const newDaily = parseInt(dailyCount || '0') + _statsBuffer.daily;
+    const newTotal = parseInt(totalCount || '0') + _statsBuffer.total;
+    await Promise.all([
+      KV.put(dailyKey, String(newDaily), { expirationTtl: 86400 * 30 }),
+      KV.put(totalKey, String(newTotal)),
+    ]);
+    _statsBuffer.daily = 0;
+    _statsBuffer.total = 0;
+  } catch (e) {
+    Logger.error('flush_stats_buffer_failed', e);
+    _statsBuffer.dirty = true;
+  } finally {
+    _statsBuffer.flushing = false;
+  }
+}
+
+function _scheduleStatsFlush() {
+  setTimeout(_flushStatsBuffer, FLUSH_INTERVAL_MS);
+}
+
 async function incrementMessageCount() {
   const today = new Date().toISOString().split('T')[0];
-  const dailyKey = `stats:messages:${today}`;
-  const totalKey = 'stats:messages:total';
-
-  try {
-    const dailyCount = await KV.get(dailyKey);
-    const totalCount = await KV.get(totalKey);
-
-    await KV.put(dailyKey, String(parseInt(dailyCount || '0') + 1), { expirationTtl: 86400 * 30 });
-    await KV.put(totalKey, String(parseInt(totalCount || '0') + 1));
-  } catch (e) {
-    Logger.error('increment_message_count_failed', e);
+  if (_statsBuffer.today !== today) {
+    if (_statsBuffer.dirty) {
+      await _flushStatsBuffer();
+    }
+    _statsBuffer.today = today;
+    _statsBuffer.daily = 0;
+    _statsBuffer.total = 0;
   }
+  _statsBuffer.daily++;
+  _statsBuffer.total++;
+  _statsBuffer.dirty = true;
+  _scheduleStatsFlush();
 }
 
 async function recordActiveUser(userId) {
@@ -2810,15 +3222,16 @@ async function getStats() {
   const today = new Date().toISOString().split('T')[0];
 
   try {
-    const totalMessages = await KV.get('stats:messages:total') || '0';
-    const todayMessages = await KV.get(`stats:messages:${today}`) || '0';
-
-    const activeUsers = await KV.get(`stats:active_users:${today}`);
+    const [totalMessages, todayMessages, activeUsers] = await Promise.all([
+      KV.get('stats:messages:total'),
+      KV.get(`stats:messages:${today}`),
+      KV.get(`stats:active_users:${today}`),
+    ]);
     const todayActiveCount = activeUsers ? JSON.parse(activeUsers).length : 0;
 
     return {
-      totalMessages: parseInt(totalMessages),
-      todayMessages: parseInt(todayMessages),
+      totalMessages: parseInt(totalMessages || '0'),
+      todayMessages: parseInt(todayMessages || '0'),
       todayActiveUsers: todayActiveCount
     };
   } catch (e) {
@@ -2832,6 +3245,9 @@ async function getStats() {
 }
 
 // 媒体组处理
+// 【优化】事件驱动的媒体组聚合，避免固定 300ms 轮询消耗 CPU 时间。
+// 算法语义保持不变：距最后一条消息静默 MEDIA_GROUP_WAIT_MS 后即提交，
+// 或达到 MEDIA_GROUP_MAX_WAIT_MS 上限强制提交。
 const mediaGroupBuffers = new Map();
 const MEDIA_GROUP_WAIT_MS = 300;
 const MEDIA_GROUP_MAX_WAIT_MS = 3000;
@@ -2846,23 +3262,76 @@ async function handleMediaGroup(msg, handler) {
   const isFirst = !buffer;
 
   if (isFirst) {
-    buffer = { messages: [], handler, lastUpdate: 0 };
+    buffer = {
+      messages: [],
+      handler,
+      lastUpdate: 0,
+      // 【优化】用 timerId 记录当前等待计时器，新消息到达可重置
+      timerId: null,
+      // resolver 用于通知"等待结束"
+      resolver: null,
+      maxDeadline: Date.now() + MEDIA_GROUP_MAX_WAIT_MS
+    };
     mediaGroupBuffers.set(groupKey, buffer);
   }
 
   buffer.messages.push(msg);
   buffer.lastUpdate = Date.now();
 
-  if (isFirst) {
-    const maxWait = Date.now() + MEDIA_GROUP_MAX_WAIT_MS;
-    while (Date.now() < maxWait) {
-      await new Promise(r => setTimeout(r, MEDIA_GROUP_WAIT_MS));
-      if (Date.now() - buffer.lastUpdate >= MEDIA_GROUP_WAIT_MS) break;
-    }
-    mediaGroupBuffers.delete(groupKey);
-    buffer.messages.sort((a, b) => a.message_id - b.message_id);
-    return buffer.handler(buffer.messages);
+  // 【优化】每条新消息到达时重置"静默 300ms"计时器（debounce 模式）
+  if (buffer.timerId) {
+    clearTimeout(buffer.timerId);
+    buffer.timerId = null;
   }
+
+  if (!isFirst) {
+    // 后续到达的消息：只需重置计时器，由首条负责最终处理
+    if (buffer.resolver) {
+      const remaining = Math.max(0, buffer.maxDeadline - Date.now());
+      const waitMs = Math.min(MEDIA_GROUP_WAIT_MS, remaining);
+      buffer.timerId = setTimeout(() => {
+        buffer.timerId = null;
+        if (buffer.resolver) {
+          const fn = buffer.resolver;
+          buffer.resolver = null;
+          fn();
+        }
+      }, waitMs);
+    }
+    return;
+  }
+
+  // 首条消息：负责等待并最终提交
+  await new Promise(resolve => {
+    buffer.resolver = resolve;
+    const remaining = Math.max(0, buffer.maxDeadline - Date.now());
+    const waitMs = Math.min(MEDIA_GROUP_WAIT_MS, remaining);
+    buffer.timerId = setTimeout(() => {
+      buffer.timerId = null;
+      if (buffer.resolver) {
+        const fn = buffer.resolver;
+        buffer.resolver = null;
+        fn();
+      }
+    }, waitMs);
+
+    // 防御：即使后续重置无限延后，也要在 MAX 时间强制结束
+    setTimeout(() => {
+      if (buffer.resolver) {
+        if (buffer.timerId) {
+          clearTimeout(buffer.timerId);
+          buffer.timerId = null;
+        }
+        const fn = buffer.resolver;
+        buffer.resolver = null;
+        fn();
+      }
+    }, MEDIA_GROUP_MAX_WAIT_MS);
+  });
+
+  mediaGroupBuffers.delete(groupKey);
+  buffer.messages.sort((a, b) => a.message_id - b.message_id);
+  return buffer.handler(buffer.messages);
 }
 
 // =================================================================
@@ -3078,6 +3547,28 @@ function shouldFallbackToCopy(result) {
   return desc.includes('message to forward not found') || desc.includes('content private');
 }
 
+function isForwardedToExpectedThread(result, target) {
+  if (!target?.threadId || !result?.ok) return true;
+  const messages = Array.isArray(result.result) ? result.result : [result.result];
+  return messages.every(msg => msg && Number(msg.message_thread_id) === Number(target.threadId));
+}
+
+async function deleteForwardedResultMessages(result, target) {
+  if (!target?.chatId || !result?.ok) return;
+  const messages = Array.isArray(result.result) ? result.result : [result.result];
+  for (const msg of messages) {
+    if (!msg?.message_id) continue;
+    try {
+      await requestTelegram('deleteMessage', {
+        chat_id: target.chatId,
+        message_id: msg.message_id
+      });
+    } catch (e) {
+      Logger.warn('delete_misdirected_forward_failed', e, { chatId: target.chatId, messageId: msg.message_id });
+    }
+  }
+}
+
 // 设置 Telegram 命令列表
 async function setBotCommands() {
   const adminCommands = [
@@ -3195,6 +3686,17 @@ addEventListener('fetch', event => {
 });
 
 async function handleWebhook(event, url) {
+  // 【安全加固】校验 Telegram Webhook secret_token 头部，防止伪造请求
+  // 该头由 Telegram 在 setWebhook 时配置，由 registerWebhook 写入
+  const incomingSecret = event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+  if (!SECRET || !constantTimeCompare(incomingSecret, SECRET)) {
+    Logger.warn('webhook_secret_mismatch', {
+      hasHeader: !!incomingSecret,
+      ip: event.request.headers.get('CF-Connecting-IP') || 'unknown'
+    });
+    return new Response('Forbidden', { status: 403 });
+  }
+
   const update = await event.request.json();
   event.waitUntil(onUpdate(update, url.origin));
   return new Response('Ok');
@@ -3235,6 +3737,19 @@ async function onMessage(message, origin) {
   // 缓存用户资料（从消息中）
   if (message.from) {
     await upsertUserProfileFromUpdate(message.from);
+  }
+
+  if (isGroupAdminChat && message.message_thread_id) {
+    if (message.forum_topic_closed) {
+      await updateThreadClosedStatus(message.message_thread_id, true);
+      Logger.info('forum_topic_closed_recorded', { threadId: message.message_thread_id });
+      return;
+    }
+    if (message.forum_topic_reopened) {
+      await updateThreadClosedStatus(message.message_thread_id, false);
+      Logger.info('forum_topic_reopened_recorded', { threadId: message.message_thread_id });
+      return;
+    }
   }
 
   // 1. 如果是管理员发消息
@@ -3321,8 +3836,8 @@ async function onMessage(message, origin) {
       });
     }
 
-    // 2. 检查本地黑名单（直接读取KV，避免缓存不一致）
-    const isBlocked = await KV.get('blocked-' + chatId);
+    // 2. 检查本地黑名单（带 L1 缓存，热路径性能优化）
+    const isBlocked = await isBlockedCached(chatId);
     if (isBlocked) {
       // 被拉黑了，回复提示
       return sendMessage({
@@ -3400,17 +3915,16 @@ async function onMessage(message, origin) {
       // 已验证，发送自动回复（如果设置了）
       const autoReplyMsg = await getConfig(CONFIG_KEYS.AUTO_REPLY_MSG);
       if (autoReplyMsg) {
-        // 检查自动回复冷却时间（10分钟）
         const autoReplyKey = `autoreply:${chatId}`;
-        const lastReply = await KV.get(autoReplyKey);
+        const lastReply = await cacheApiGet(autoReplyKey) || await KV.get(autoReplyKey);
 
         if (!lastReply) {
           await sendMessage({
             chat_id: chatId,
             text: autoReplyMsg
           });
-          // 记录发送时间，10分钟后过期
           await KV.put(autoReplyKey, '1', { expirationTtl: 600 });
+          await cacheApiSet(autoReplyKey, '1', 600);
         }
       }
       // 正常转发给管理员
@@ -3442,10 +3956,8 @@ async function onEditedMessage(message, origin) {
       return handleGuestEditedMessage(message);
     }
 
-    // 1. 检查黑名单
-    const isBlocked = await KV.get('blocked-' + chatId);
+    const isBlocked = await isBlockedCached(chatId);
     if (isBlocked) {
-      // 被拉黑了，忽略编辑
       return;
     }
 
@@ -3499,7 +4011,7 @@ async function getTargetId(message, commandName) {
 }
 
 // 获取已验证用户列表（支持分页和过滤）
-async function getVerifiedUsers(page = 1, pageSize = 10, filter = 'all') {
+async function getVerifiedUsersPaged(page = 1, pageSize = 10, filter = 'all') {
   // 获取所有已验证用户（会自动处理新旧版本迁移）
   const allUsers = await getAllVerifiedUsers();
 
@@ -3511,7 +4023,7 @@ async function getVerifiedUsers(page = 1, pageSize = 10, filter = 'all') {
     // 获取每个用户的详细信息并过滤
     const userDetails = [];
     for (const [userId, userName] of allUsers) {
-      const blocked = await KV.get('blocked-' + userId);
+      const blocked = await isBlockedCached(userId);
       const whitelisted = await isWhitelisted(userId);
 
       const user = {
@@ -3933,7 +4445,7 @@ async function generateStatsSubmenu() {
 
 // 生成用户管理子菜单
 async function generateUsersSubmenu(page = 1, filter = 'all') {
-  const result = await getVerifiedUsers(page, 10, filter);
+  const result = await getVerifiedUsersPaged(page, 10, filter);
 
   // 获取各类用户数量统计
   const stats = await getUserStats();
@@ -4052,7 +4564,7 @@ async function getUserStats() {
     const isWhite = await isWhitelisted(userId);
     if (isWhite) whitelisted++;
 
-    const isBlocked = await KV.get('blocked-' + userId);
+    const isBlocked = await isBlockedCached(userId);
     if (isBlocked) blocked++;
   }
 
@@ -4835,6 +5347,7 @@ async function handleAdminMessage(message) {
   const spamTopicWaitKey = `spam_topic_config_wait:${adminChatId}`;
   const isWaitingForSpamTopicId = await KV.get(spamTopicWaitKey);
   if (isWaitingForSpamTopicId) {
+    const replyTarget = getReplyTarget();
     await KV.delete(spamTopicWaitKey);
 
     // 获取最后一个菜单消息 ID（从 KV 中存储）
@@ -4864,7 +5377,7 @@ async function handleAdminMessage(message) {
         });
       }
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '❌ 已取消配置垃圾话题 ID'
       });
     }
@@ -4890,12 +5403,12 @@ async function handleAdminMessage(message) {
         }
 
         return sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `✅ 垃圾话题已自动创建，ID: <code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
         });
       } else {
         return sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: '❌ 自动创建失败，请检查机器人是否为群组管理员'
         });
       }
@@ -4910,7 +5423,7 @@ async function handleAdminMessage(message) {
 
     if (!/^\d+$/.test(topicId)) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '❌ 无效的话题 ID，请输入纯数字或话题链接'
       });
     }
@@ -4934,7 +5447,7 @@ async function handleAdminMessage(message) {
     }
 
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: `✅ 垃圾话题 ID 已设置：<code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
     });
   }
@@ -5154,8 +5667,8 @@ async function handleAdminMessage(message) {
     const targetId = await getTargetId(message, '/ban');
     const replyTarget = getReplyTarget();
     if (targetId) {
-      await KV.put('blocked-' + targetId, 'true'); // 永久拉黑
-      memDelete('blocked-' + targetId); // 清除缓存
+      await KV.put('blocked-' + targetId, 'true');
+      await invalidateBlockedCache(targetId);
       await removeVerifiedUser(targetId); // 从已验证列表移除
       return sendMessage({ ...replyTarget, text: `🚫 用户 <code>${targetId}</code> 已被封禁。` });
     } else {
@@ -5169,7 +5682,7 @@ async function handleAdminMessage(message) {
     const replyTarget = getReplyTarget();
     if (targetId) {
       await KV.delete('blocked-' + targetId);
-      memDelete('blocked-' + targetId); // 清除缓存
+      await invalidateBlockedCache(targetId);
       return sendMessage({ ...replyTarget, text: `✅ 用户 <code>${targetId}</code> 已解封。` });
     } else {
       return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /unban\n或发送 /unban 123456 (必须是数字 ID)' });
@@ -5191,7 +5704,7 @@ async function handleAdminMessage(message) {
       }
 
       await KV.delete('verified-' + targetId);
-      memDelete('verified-' + targetId); // 清除缓存
+      await invalidateCache('verified-' + targetId);
       await removeVerifiedUser(targetId); // 从已验证列表移除
       return sendMessage({ ...replyTarget, text: `🔄 用户 <code>${targetId}</code> 验证状态已取消。` });
     } else {
@@ -5201,10 +5714,11 @@ async function handleAdminMessage(message) {
 
   // 指令：/broadcast - 广播消息
   if (text === '/broadcast' || text.startsWith('/broadcast ')) {
+    const replyTarget = getReplyTarget();
     const broadcastMsg = text === '/broadcast' ? '' : text.slice(10).trim();
     if (!broadcastMsg) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 格式错误。\n用法：/broadcast 消息内容\n\n支持 HTML 格式：\n<b>粗体</b> <i>斜体</i> <code>代码</code>'
       });
     }
@@ -5214,7 +5728,7 @@ async function handleAdminMessage(message) {
     if (!rateLimit.allowed) {
       const remainingHours = Math.ceil(rateLimit.retryAfter / 3600);
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。\n\n限额：${rateLimit.limit} 次/24 小时`
       });
     }
@@ -5230,7 +5744,7 @@ async function handleAdminMessage(message) {
       if (remainingMs > 0) {
         const remainingHours = Math.ceil(remainingMs / (60 * 60 * 1000));
         return sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。`
         });
       }
@@ -5254,7 +5768,7 @@ async function handleAdminMessage(message) {
     inlineKeyboard.push([{ text: '❌ 取消广播', callback_data: 'bcancel' }]);
 
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}`,
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: inlineKeyboard }
@@ -5288,9 +5802,10 @@ async function handleAdminMessage(message) {
 
   // 指令：/bcancel - 取消广播（保留命令方式作为备选）
   if (text === '/bcancel') {
+    const replyTarget = getReplyTarget();
     await KV.delete(`broadcast_msg:${adminChatId}`);
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: '✅ 已取消广播'
     });
   }
@@ -5307,6 +5822,7 @@ async function handleAdminMessage(message) {
   // 指令：/cachestats - 查看缓存统计
   if (text === '/cachestats') {
     const stats = getCacheStats();
+    const replyTarget = getReplyTarget();
     const text = `📊 <b>缓存统计信息</b>\n\n` +
       `<b>L1 内存缓存：</b>\n` +
       `  命中：${stats.l1.hits}\n` +
@@ -5320,7 +5836,7 @@ async function handleAdminMessage(message) {
       `<i>提示：命中率越高，性能越好</i>`;
 
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: text,
       parse_mode: 'HTML'
     });
@@ -5328,9 +5844,10 @@ async function handleAdminMessage(message) {
 
   // 指令：/clearcache - 清空所有缓存
   if (text === '/clearcache') {
+    const replyTarget = getReplyTarget();
     clearAllCache();
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: '✅ 已清空所有缓存\n\nL1 内存缓存和统计信息已重置。\nL2 KV 缓存将在到期后自动清理。',
       parse_mode: 'HTML'
     });
@@ -5338,12 +5855,13 @@ async function handleAdminMessage(message) {
 
   // 指令：/restore - 从垃圾话题恢复消息
   if (text === '/restore' && reply) {
+    const replyTarget = getReplyTarget();
     const spamTopicConfig = await getSpamTopicConfig();
     const isTopicMode = await isTopicForwardingEnabled();
 
     if (!spamTopicConfig.topicId || !(await isSpamTopicEnabled())) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 垃圾话题功能未启用，无法恢复消息。'
       });
     }
@@ -5351,7 +5869,7 @@ async function handleAdminMessage(message) {
     const replyChatIdStr = reply.chat?.id ? String(reply.chat.id) : null;
     if (replyChatIdStr !== GROUP_ID || !reply.message_thread_id || String(reply.message_thread_id) !== String(spamTopicConfig.topicId)) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 请回复垃圾话题中的消息来恢复。\n\n提示：只有垃圾话题中的消息才能被恢复。'
       });
     }
@@ -5362,25 +5880,25 @@ async function handleAdminMessage(message) {
     if (restoreResult.success) {
       if (isTopicMode && targetThreadId) {
         await sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `✅ 消息已恢复到用户话题\n\nUID: <code>${restoreResult.guestChatId}</code>\n话题 ID: <code>${targetThreadId}</code>`,
           parse_mode: 'HTML'
         });
       } else {
         await sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `✅ 消息已恢复并发送给用户\n\nUID: <code>${restoreResult.guestChatId}</code>`,
           parse_mode: 'HTML'
         });
       }
     } else if (restoreResult.reason === 'no_mapping') {
       await sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 未找到消息映射关系，无法恢复。\n\n可能原因：消息映射已过期（超过48小时）或消息不是通过垃圾话题功能转发的。'
       });
     } else {
       await sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '❌ 恢复消息失败，请稍后重试。'
       });
     }
@@ -5442,7 +5960,7 @@ async function handleAdminMessage(message) {
       });
 
       return sendMessage({
-        chat_id: adminChatId,
+        ...(isInTopic ? { chat_id: contextChatId, message_thread_id: message.message_thread_id } : { chat_id: adminChatId }),
         text: '✅ 垃圾过滤规则已更新'
       });
     }
@@ -5454,7 +5972,7 @@ async function handleAdminMessage(message) {
     // 【修复】检查是否是回复消息但发送了无效命令
     if (isCommandLike && !isValidCommand) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...(isInTopic ? { chat_id: contextChatId, message_thread_id: message.message_thread_id } : { chat_id: adminChatId }),
         text: `⚠️ 无效命令 "${text.split(' ')[0]}"\n\n请检查命令拼写，或发送 /help 查看所有可用指令。`,
         parse_mode: 'HTML'
       });
@@ -5478,14 +5996,15 @@ async function handleAdminMessage(message) {
       return copyReq;
     } else {
       return sendMessage({
-        chat_id: adminChatId,
+        ...(isInTopic ? { chat_id: contextChatId, message_thread_id: message.message_thread_id } : { chat_id: adminChatId }),
         text: '⚠️ 未找到原用户映射，可能消息太旧或被清理了缓存。'
       });
     }
   } else {
     // 既不是指令也不是回复，提示使用 /help
+    const replyTarget = getReplyTarget();
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: '🤖 请发送 /help 查看所有可用指令，或直接回复用户消息进行转发。',
       parse_mode: 'HTML'
     });
@@ -5570,12 +6089,11 @@ async function handleCleanupCommand(message, options = {}, overrideChatId = null
             // 删除失效的映射
             await safeKvDelete(key); // user:{userId}
             await safeKvDelete(`thread:${threadId}`); // thread:{threadId}
-            await safeKvDelete(`verified-${userId}`); // verified-{userId}
+            await safeKvDelete(`verified-${userId}`);
 
-            // 清理缓存
-            memDelete(key);
+            await invalidateCache(key);
+            await invalidateCache(`verified-${userId}`);
             memDelete(`thread:${threadId}`);
-            memDelete(`verified-${userId}`);
             threadHealthCache.delete(`thread:${threadId}`);
 
             cleanedCount++;
@@ -5661,10 +6179,11 @@ async function handleCleanupCommand(message, options = {}, overrideChatId = null
 async function handleVerification(message, chatId, origin) {
   // 获取当前验证模式
   const verifyMode = await getVerifyMode();
+  const text = (message?.text || '').trim();
 
   // 【并发保护】暂存当前消息（如果有）
-  if (message && message.message_id) {
-    const queue = await appendPendingQueue(chatId, message.message_id);
+  if (message && message.message_id && text !== '/start') {
+    const queue = await appendPendingQueue(chatId, message);
     Logger.debug('message_queued_for_verification', { userId: chatId, messageId: message.message_id, queueLength: queue.length });
 
     // 如果队列已满，提示用户
@@ -6188,6 +6707,7 @@ async function handleVerifyCallback(request) {
     const verifiedKey = 'verified-' + String(uid);
     await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
     memSet(verifiedKey, 'true', 5 * 60 * 1000);
+    await cacheApiSet(verifiedKey, 'true', 300);
 
     let displayName = 'Unknown';
     if (userInfo) {
@@ -6373,6 +6893,11 @@ async function forwardMessagesToTarget(messages, userId, target) {
 
 async function handleSingleForwardResult(result, msg, target, userId) {
   if (result.ok && result.result && result.result.message_id) {
+    if (!isForwardedToExpectedThread(result, target)) {
+      Logger.warn('single_forward_misdirected_thread', { userId, expectedThreadId: target.threadId, actualThreadId: result.result.message_thread_id });
+      await deleteForwardedResultMessages(result, target);
+      return { success: false, errorType: 'thread_not_found' };
+    }
     await storeForwardMapping(result.result.message_id, msg, target);
     return { success: true };
   }
@@ -6485,6 +7010,11 @@ async function tryCopySingleMessage(msg, target) {
 
   const copyReq = await requestTelegram('copyMessage', payload);
   if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+    if (!isForwardedToExpectedThread(copyReq, target)) {
+      Logger.warn('copy_single_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
+      await deleteForwardedResultMessages(copyReq, target);
+      return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
+    }
     await storeForwardMapping(copyReq.result.message_id, msg, target);
     return { success: true };
   }
@@ -6502,6 +7032,11 @@ async function copyMessagesIndividually(messages, target) {
 
     const copyReq = await requestTelegram('copyMessage', payload);
     if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+      if (!isForwardedToExpectedThread(copyReq, target)) {
+        Logger.warn('copy_batch_item_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
+        await deleteForwardedResultMessages(copyReq, target);
+        return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
+      }
       await storeForwardMapping(copyReq.result.message_id, msg, target);
     } else {
       return { success: false, rawResult: copyReq };
@@ -6682,23 +7217,26 @@ async function handleQuizCallback(callbackQuery) {
   const messageId = callbackQuery.message.message_id;
   const chatId = callbackQuery.message.chat.id;
 
+  // 【优化】使用 try/finally 统一管理验证锁的释放，避免分支遗漏导致死锁残留
+  let lockAcquired = false;
+
   try {
     // 【并发保护】尝试获取验证锁
     const lockResult = await tryAcquireVerifyLock(userId);
     if (!lockResult.acquired) {
       const waitTime = Math.ceil(lockResult.lockInfo.remainingMs / 1000);
-      return requestTelegram('answerCallbackQuery', {
+      return await requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: `⏳ 验证进行中，请等待 ${waitTime} 秒后再试`,
         show_alert: true
       });
     }
+    lockAcquired = true;
 
     // 【优化】解析答案索引，严格验证格式
     const parts = data.split(':');
     if (parts.length !== 2) {
-      await releaseVerifyLock(userId);
-      return requestTelegram('answerCallbackQuery', {
+      return await requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: '❌ 无效的数据格式',
         show_alert: true
@@ -6707,8 +7245,7 @@ async function handleQuizCallback(callbackQuery) {
 
     const answerIndex = parseInt(parts[1]);
     if (isNaN(answerIndex) || answerIndex < 0 || answerIndex > 3) {
-      await releaseVerifyLock(userId);
-      return requestTelegram('answerCallbackQuery', {
+      return await requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: '❌ 无效的选项',
         show_alert: true
@@ -6718,8 +7255,7 @@ async function handleQuizCallback(callbackQuery) {
     // 【优化】检查验证尝试频率限制
     const attemptLimit = checkRateLimit(userId, 'verifyAttempt');
     if (!attemptLimit.allowed) {
-      await releaseVerifyLock(userId);
-      return requestTelegram('answerCallbackQuery', {
+      return await requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: `⏳ 尝试过于频繁，请等待 ${attemptLimit.retryAfter} 秒后再试`,
         show_alert: true
@@ -6734,8 +7270,8 @@ async function handleQuizCallback(callbackQuery) {
       const verifiedKey = 'verified-' + userId;
       await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
       memSet(verifiedKey, 'true', 5 * 60 * 1000);
+      await cacheApiSet(verifiedKey, 'true', 300);
 
-      // 添加到已验证用户列表
       const user = callbackQuery.from;
       const userName = user.username || user.first_name || 'Unknown';
       await addVerifiedUser(userId, userName);
@@ -6793,8 +7329,7 @@ async function handleQuizCallback(callbackQuery) {
         Logger.error('record_active_user_failed', e, { userId });
       }
 
-      await releaseVerifyLock(userId);
-      return requestTelegram('answerCallbackQuery', {
+      return await requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: '验证成功！'
       });
@@ -6812,8 +7347,7 @@ async function handleQuizCallback(callbackQuery) {
           Logger.error('edit_reply_markup_failed', e, { userId });
         }
 
-        await releaseVerifyLock(userId);
-        return requestTelegram('answerCallbackQuery', {
+        return await requestTelegram('answerCallbackQuery', {
           callback_query_id: callbackQuery.id,
           text: result.message,
           show_alert: true
@@ -6821,8 +7355,7 @@ async function handleQuizCallback(callbackQuery) {
       }
 
       // 答案错误但还可以继续尝试
-      await releaseVerifyLock(userId);
-      return requestTelegram('answerCallbackQuery', {
+      return await requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: result.message,
         show_alert: true
@@ -6830,16 +7363,20 @@ async function handleQuizCallback(callbackQuery) {
     }
   } catch (e) {
     Logger.error('handle_quiz_callback_failed', e, { userId });
-    try {
-      await releaseVerifyLock(userId);
-    } catch (e2) {
-      Logger.error('release_lock_failed', e2, { userId });
-    }
     return requestTelegram('answerCallbackQuery', {
       callback_query_id: callbackQuery.id,
       text: '❌ 验证处理出错，请重试',
       show_alert: true
     });
+  } finally {
+    // 【优化】统一锁释放：无论成功失败、是否提前 return，都会执行
+    if (lockAcquired) {
+      try {
+        await releaseVerifyLock(userId);
+      } catch (e) {
+        Logger.error('release_lock_failed', e, { userId });
+      }
+    }
   }
 }
 
